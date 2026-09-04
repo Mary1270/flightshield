@@ -73,7 +73,7 @@ planefinder.net
 
 ## Testing
 
-73 offline unit tests across two files, run with plain `unittest`
+76 offline unit tests across two files, run with plain `unittest`
 (no network access needed, no live GenLayer node needed):
 
 ```bash
