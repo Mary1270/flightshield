@@ -1,0 +1,15 @@
+FlightShield - Two-Party Flight Delay/Cancellation Settlement with Real GEN Escrow
+
+A new Intelligent Contract (not an update to an existing submission), built specifically to close three gaps my previously accepted OilPriceOracle v3 (Endpoint Policy Commitment) disclosed but left open:
+
+1. "Actually moving funds based on the winner is intentionally NOT implemented" - FlightShield locks real GEN via @gl.public.write.payable at create_agreement/fund_agreement, and pays the winner automatically via emit_transfer on resolution.
+2. party_a/party_b were free-text strings, not bound to a caller identity - here they ARE gl.message.sender_address values, enforced on every fund-moving call.
+3. A committed source policy could strand an agreement forever, with no on-chain recovery - request_cancel adds mutual-consent cancellation that refunds both parties without needing a working oracle result.
+
+Architecture deliberately reuses the multi-source corroboration pattern already reviewed and accepted in OilPriceOracle/GoldPriceOracle (reputable-domain allowlist, 2+ independent sources required, deterministic Python parsing of LLM-classified fields, gl.eq_principle.prompt_comparative for consensus) - applied to flight-tracking sources (flightaware.com, flightstats.com, flightradar24.com, flightview.com, planefinder.net) instead of price sources.
+
+Verified by 76 offline tests (test_aggregation.py + test_end_to_end.py), and live-tested end-to-end on GenLayer Studio with two real funded addresses and a real scheduled flight (BA286, SFO-LHR): create_agreement/fund_agreement validation and identity/amount enforcement, mutual-consent request_cancel with real refunds via emit_transfer, and the Indeterminate safety path (agreement stays funded, no funds move, when fewer than 2 independent reputable sources agree).
+
+Live testing also surfaced and fixed one real bug: flightaware.com serves regional subdomains (uk.flightaware.com, m.flightaware.com) that were being rejected under naive exact-domain allowlist matching despite rendering fine; _canonical_reputable_domain() now correctly treats subdomains of an allowlisted domain as that same tracker. See README "Bug found and fixed during live testing" for details.
+
+One real, disclosed constraint was confirmed empirically rather than assumed: flight-tracking sites only populate live status after departure and roll over to the next scheduled instance of a flight number once the current one is no longer "live" - so resolve_agreement has a real, narrow evidence window per flight_date, and correctly returns Indeterminate outside it rather than guessing. Documented in README "Known limitations" with the exact observed behavior.
