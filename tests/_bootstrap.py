@@ -21,6 +21,7 @@ FlightShield = _contract_module.FlightShield
 gl = _contract_module.gl
 
 from genlayer import tx_context, Address, _TransferRecorder  # noqa: E402
+import datetime as _real_datetime_module  # noqa: E402
 
 
 def make_contract() -> "FlightShield":
@@ -34,3 +35,39 @@ def transfers():
 
 def reset_transfers():
     _TransferRecorder.reset()
+
+
+class _ControllableDatetime:
+    """
+    TEST-ONLY stand-in for the `datetime` class contract.py imports.
+    Swapped into the loaded contract module's namespace so tests can
+    pin "now" to an exact value (simulating the passage of time for
+    timeout logic) without needing a real GenVM. `fromisoformat`
+    delegates to the real implementation so stored ISO strings still
+    round-trip correctly.
+    """
+
+    _current = None
+
+    @classmethod
+    def now(cls):
+        if cls._current is not None:
+            return cls._current
+        return _real_datetime_module.datetime.now()
+
+    @staticmethod
+    def fromisoformat(s):
+        return _real_datetime_module.datetime.fromisoformat(s)
+
+
+_contract_module.datetime = _ControllableDatetime
+
+
+def set_now(dt):
+    """Pin the contract's notion of 'now' to an exact datetime for this test."""
+    _ControllableDatetime._current = dt
+
+
+def reset_now():
+    """Return the contract's notion of 'now' to the real wall clock."""
+    _ControllableDatetime._current = None

@@ -1,9 +1,17 @@
 import json
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta
 
-from _bootstrap import make_contract, gl, transfers, reset_transfers
+from _bootstrap import make_contract, gl, transfers, reset_transfers, set_now, reset_now
 from genlayer import tx_context
+
+PARTY_A = "0x" + "a" * 40
+PARTY_B = "0x" + "b" * 40
+PARTY_B_UPPER = "0x" + "B" * 40  # same address as PARTY_B, different casing
+INTRUDER = "0x" + "c" * 40
+SOMEONE_ELSE = "0x" + "d" * 40
+
+T0 = datetime(2026, 9, 1, 12, 0, 0)
 
 
 def set_pipeline(render_value, prompt_value):
@@ -35,15 +43,27 @@ class BaseCase(unittest.TestCase):
     def setUp(self):
         self.c = make_contract()
         reset_transfers()
+        set_now(T0)
 
-    def create(self, side_a="PayoutTriggered", stake=1000, required=None, threshold=60):
-        with tx_context("0xA", stake):
+    def tearDown(self):
+        reset_now()
+
+    def create(
+        self,
+        side_a="PayoutTriggered",
+        stake=1000,
+        required=None,
+        threshold=60,
+        party_b=PARTY_B,
+        sender=PARTY_A,
+    ):
+        with tx_context(sender, stake):
             raw = self.c.create_agreement(
-                "0xB", "AA100", "2026-09-10", threshold, side_a, "test agreement", required
+                party_b, "AA100", "2026-09-10", threshold, side_a, "test agreement", required
             )
         return json.loads(raw)
 
-    def fund(self, agreement_id, stake=1000, sender="0xB"):
+    def fund(self, agreement_id, stake=1000, sender=PARTY_B):
         with tx_context(sender, stake):
             raw = self.c.fund_agreement(agreement_id)
         return json.loads(raw)
@@ -52,37 +72,69 @@ class BaseCase(unittest.TestCase):
 class TestCreateAgreementValidation(BaseCase):
     def test_requires_positive_stake(self):
         with self.assertRaises(Exception):
-            with tx_context("0xA", 0):
-                self.c.create_agreement("0xB", "AA100", "2026-09-10", 60, "PayoutTriggered", "x")
+            with tx_context(PARTY_A, 0):
+                self.c.create_agreement(
+                    PARTY_B, "AA100", "2026-09-10", 60, "PayoutTriggered", "x"
+                )
 
     def test_party_b_cannot_equal_sender(self):
         with self.assertRaises(Exception):
-            with tx_context("0xA", 100):
-                self.c.create_agreement("0xA", "AA100", "2026-09-10", 60, "PayoutTriggered", "x")
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(
+                    PARTY_A, "AA100", "2026-09-10", 60, "PayoutTriggered", "x"
+                )
+
+    def test_party_b_cannot_equal_sender_different_casing(self):
+        # Same real address as sender, just different letter-casing -
+        # must still be caught, since canonicalization happens first.
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(
+                    PARTY_A.upper().replace("0X", "0x"),
+                    "AA100",
+                    "2026-09-10",
+                    60,
+                    "PayoutTriggered",
+                    "x",
+                )
+
+    def test_malformed_party_b_rejected(self):
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(
+                    "not-an-address", "AA100", "2026-09-10", 60, "PayoutTriggered", "x"
+                )
 
     def test_requires_flight_number(self):
         with self.assertRaises(Exception):
-            with tx_context("0xA", 100):
-                self.c.create_agreement("0xB", "  ", "2026-09-10", 60, "PayoutTriggered", "x")
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(PARTY_B, "  ", "2026-09-10", 60, "PayoutTriggered", "x")
 
     def test_rejects_negative_threshold(self):
         with self.assertRaises(Exception):
-            with tx_context("0xA", 100):
-                self.c.create_agreement("0xB", "AA100", "2026-09-10", -5, "PayoutTriggered", "x")
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(PARTY_B, "AA100", "2026-09-10", -5, "PayoutTriggered", "x")
 
     def test_rejects_bad_side(self):
         with self.assertRaises(Exception):
-            with tx_context("0xA", 100):
-                self.c.create_agreement("0xB", "AA100", "2026-09-10", 60, "Sideways", "x")
+            with tx_context(PARTY_A, 100):
+                self.c.create_agreement(PARTY_B, "AA100", "2026-09-10", 60, "Sideways", "x")
 
     def test_success_locks_stake_and_status(self):
         rec = self.create(stake=500)
         self.assertEqual(rec["status"], "awaiting_funding")
         self.assertEqual(rec["stake"], "500")
-        self.assertEqual(rec["party_a_address"], "0xA")
-        self.assertEqual(rec["party_b_address"], "0xB")
+        self.assertEqual(rec["party_a_address"], PARTY_A)
+        self.assertEqual(rec["party_b_address"], PARTY_B)
         self.assertTrue(rec["funded_a"])
         self.assertFalse(rec["funded_b"])
+        self.assertEqual(rec["created_at"], T0.isoformat())
+        self.assertIsNone(rec["funded_at"])
+        self.assertIsNone(rec["cancel_reason"])
+
+    def test_party_b_stored_canonically_regardless_of_input_casing(self):
+        rec = self.create(party_b=PARTY_B_UPPER)
+        self.assertEqual(rec["party_b_address"], PARTY_B)  # stored lowercased
 
     def test_agreement_count_increments(self):
         self.create()
@@ -94,7 +146,7 @@ class TestFundAgreement(BaseCase):
     def test_wrong_sender_rejected(self):
         self.create()
         with self.assertRaises(Exception):
-            self.fund("0", sender="0xC")
+            self.fund("0", sender=INTRUDER)
 
     def test_wrong_amount_too_low_rejected(self):
         self.create(stake=1000)
@@ -111,6 +163,15 @@ class TestFundAgreement(BaseCase):
         rec = self.fund("0", stake=1000)
         self.assertEqual(rec["status"], "funded")
         self.assertTrue(rec["funded_b"])
+        self.assertEqual(rec["funded_at"], T0.isoformat())
+
+    def test_funding_from_differently_cased_party_b_succeeds(self):
+        # party_b was stored canonically lowercased; the real party_b
+        # wallet funding with a different-cased signature must still
+        # match, since the sender is canonicalized the same way.
+        self.create(stake=1000, party_b=PARTY_B)
+        rec = self.fund("0", stake=1000, sender=PARTY_B_UPPER)
+        self.assertEqual(rec["status"], "funded")
 
     def test_double_funding_rejected(self):
         self.create(stake=1000)
@@ -121,6 +182,122 @@ class TestFundAgreement(BaseCase):
     def test_funding_nonexistent_agreement_rejected(self):
         with self.assertRaises(Exception):
             self.fund("999", stake=1000)
+
+
+class TestReclaimUnfundedStake(BaseCase):
+    def test_cannot_reclaim_before_timeout(self):
+        self.create(stake=1000)
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A):
+                self.c.reclaim_unfunded_stake("0")
+
+    def test_cannot_reclaim_just_under_timeout(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT - timedelta(seconds=1))
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A):
+                self.c.reclaim_unfunded_stake("0")
+
+    def test_can_reclaim_exactly_at_timeout(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT)
+        with tx_context(PARTY_A):
+            rec = json.loads(self.c.reclaim_unfunded_stake("0"))
+        self.assertEqual(rec["status"], "cancelled")
+        self.assertEqual(rec["cancel_reason"], "unfunded_timeout")
+        self.assertEqual(transfers(), [{"to": PARTY_A, "value": 1000}])
+
+    def test_can_reclaim_well_after_timeout(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT + timedelta(days=30))
+        with tx_context(PARTY_A):
+            rec = json.loads(self.c.reclaim_unfunded_stake("0"))
+        self.assertEqual(rec["status"], "cancelled")
+
+    def test_only_party_a_can_reclaim(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT)
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_B):
+                self.c.reclaim_unfunded_stake("0")
+        with self.assertRaises(Exception):
+            with tx_context(INTRUDER):
+                self.c.reclaim_unfunded_stake("0")
+
+    def test_cannot_reclaim_once_funded(self):
+        self.create(stake=1000)
+        self.fund("0", stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT + timedelta(days=1))
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A):
+                self.c.reclaim_unfunded_stake("0")
+
+    def test_cannot_reclaim_twice(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.UNFUNDED_TIMEOUT)
+        with tx_context(PARTY_A):
+            self.c.reclaim_unfunded_stake("0")
+        with self.assertRaises(Exception):
+            with tx_context(PARTY_A):
+                self.c.reclaim_unfunded_stake("0")
+
+
+class TestForceCloseStalemate(BaseCase):
+    def _fund_and_attempt_once(self):
+        self.create(stake=1000)
+        self.fund("0", stake=1000)
+        stale_prompt = dict(GOOD_PROMPT_TRIGGERED, FRESHNESS="Stale")
+        set_pipeline("page", stale_prompt)
+        self.c.resolve_agreement("0", THREE_URLS)  # -> Indeterminate
+
+    def test_cannot_close_without_any_resolution_attempt(self):
+        self.create(stake=1000)
+        self.fund("0", stake=1000)
+        set_now(T0 + self.c.STALEMATE_TIMEOUT + timedelta(days=1))
+        with self.assertRaises(Exception):
+            self.c.force_close_stalemate("0")
+
+    def test_cannot_close_before_timeout_even_with_attempt(self):
+        self._fund_and_attempt_once()
+        with self.assertRaises(Exception):
+            self.c.force_close_stalemate("0")
+
+    def test_can_close_after_timeout_with_attempt(self):
+        self._fund_and_attempt_once()
+        set_now(T0 + self.c.STALEMATE_TIMEOUT)
+        rec = json.loads(self.c.force_close_stalemate("0"))
+        self.assertEqual(rec["status"], "cancelled")
+        self.assertEqual(rec["cancel_reason"], "stalemate_timeout")
+        self.assertCountEqual(
+            transfers(),
+            [{"to": PARTY_A, "value": 1000}, {"to": PARTY_B, "value": 1000}],
+        )
+
+    def test_callable_by_anyone_since_outcome_is_fixed(self):
+        self._fund_and_attempt_once()
+        set_now(T0 + self.c.STALEMATE_TIMEOUT)
+        with tx_context(SOMEONE_ELSE):
+            rec = json.loads(self.c.force_close_stalemate("0"))
+        self.assertEqual(rec["status"], "cancelled")
+        self.assertCountEqual(
+            transfers(),
+            [{"to": PARTY_A, "value": 1000}, {"to": PARTY_B, "value": 1000}],
+        )
+
+    def test_cannot_close_awaiting_funding_agreement(self):
+        self.create(stake=1000)
+        set_now(T0 + self.c.STALEMATE_TIMEOUT + timedelta(days=1))
+        with self.assertRaises(Exception):
+            self.c.force_close_stalemate("0")
+
+    def test_cannot_close_already_resolved_agreement(self):
+        self.create(stake=1000)
+        self.fund("0", stake=1000)
+        set_pipeline("page", GOOD_PROMPT_TRIGGERED)
+        self.c.resolve_agreement("0", THREE_URLS)
+        set_now(T0 + self.c.STALEMATE_TIMEOUT + timedelta(days=1))
+        with self.assertRaises(Exception):
+            self.c.force_close_stalemate("0")
 
 
 class TestResolveDomainPolicy(BaseCase):
@@ -183,7 +360,7 @@ class TestResolveOutcomesAndPayout(BaseCase):
         self.assertEqual(rec["winner"], "party_a")
         self.assertEqual(rec["status"], "resolved")
         self.assertEqual(rec["payout_amount"], "2000")
-        self.assertEqual(transfers(), [{"to": "0xA", "value": 2000}])
+        self.assertEqual(transfers(), [{"to": PARTY_A, "value": 2000}])
 
     def test_party_b_wins_when_triggered_but_bet_no_payout(self):
         self.create(side_a="NoPayout", stake=1000)
@@ -191,7 +368,7 @@ class TestResolveOutcomesAndPayout(BaseCase):
         set_pipeline("page", GOOD_PROMPT_TRIGGERED)
         rec = json.loads(self.c.resolve_agreement("0", THREE_URLS))
         self.assertEqual(rec["winner"], "party_b")
-        self.assertEqual(transfers(), [{"to": "0xB", "value": 2000}])
+        self.assertEqual(transfers(), [{"to": PARTY_B, "value": 2000}])
 
     def test_party_a_wins_when_ontime_and_bet_no_payout(self):
         self.create(side_a="NoPayout", stake=1000)
@@ -261,17 +438,17 @@ class TestResolveOutcomesAndPayout(BaseCase):
         self.create(side_a="PayoutTriggered", stake=1000)
         self.fund("0", stake=1000)
         set_pipeline("page", GOOD_PROMPT_TRIGGERED)
-        with tx_context("0xSomeoneElseEntirely", 0):
+        with tx_context(SOMEONE_ELSE, 0):
             rec = json.loads(self.c.resolve_agreement("0", THREE_URLS))
         self.assertEqual(rec["winner"], "party_a")
-        self.assertEqual(transfers(), [{"to": "0xA", "value": 2000}])
+        self.assertEqual(transfers(), [{"to": PARTY_A, "value": 2000}])
 
 
 class TestCancellation(BaseCase):
     def test_single_consent_does_not_cancel(self):
         self.create()
         self.fund("0")
-        with tx_context("0xA"):
+        with tx_context(PARTY_A):
             rec = json.loads(self.c.request_cancel("0"))
         self.assertEqual(rec["status"], "funded")
         self.assertTrue(rec["cancel_consent_a"])
@@ -281,30 +458,31 @@ class TestCancellation(BaseCase):
     def test_mutual_consent_cancels_and_refunds_both(self):
         self.create(stake=1000)
         self.fund("0", stake=1000)
-        with tx_context("0xA"):
+        with tx_context(PARTY_A):
             self.c.request_cancel("0")
-        with tx_context("0xB"):
+        with tx_context(PARTY_B):
             rec = json.loads(self.c.request_cancel("0"))
         self.assertEqual(rec["status"], "cancelled")
+        self.assertEqual(rec["cancel_reason"], "mutual_consent")
         self.assertCountEqual(
             transfers(),
-            [{"to": "0xA", "value": 1000}, {"to": "0xB", "value": 1000}],
+            [{"to": PARTY_A, "value": 1000}, {"to": PARTY_B, "value": 1000}],
         )
 
     def test_cancel_before_funding_only_refunds_party_a(self):
         self.create(stake=1000)  # not funded by B yet
-        with tx_context("0xA"):
+        with tx_context(PARTY_A):
             self.c.request_cancel("0")
-        with tx_context("0xB"):
+        with tx_context(PARTY_B):
             rec = json.loads(self.c.request_cancel("0"))
         self.assertEqual(rec["status"], "cancelled")
-        self.assertEqual(transfers(), [{"to": "0xA", "value": 1000}])
+        self.assertEqual(transfers(), [{"to": PARTY_A, "value": 1000}])
 
     def test_non_party_cannot_request_cancel(self):
         self.create()
         self.fund("0")
         with self.assertRaises(Exception):
-            with tx_context("0xIntruder"):
+            with tx_context(INTRUDER):
                 self.c.request_cancel("0")
 
     def test_cannot_cancel_after_resolved(self):
@@ -313,7 +491,7 @@ class TestCancellation(BaseCase):
         set_pipeline("page", GOOD_PROMPT_TRIGGERED)
         self.c.resolve_agreement("0", THREE_URLS)
         with self.assertRaises(Exception):
-            with tx_context("0xA"):
+            with tx_context(PARTY_A):
                 self.c.request_cancel("0")
 
 

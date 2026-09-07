@@ -40,17 +40,43 @@ class TestParseDelayMinutes(unittest.TestCase):
     def test_min_abbreviation(self):
         self.assertEqual(self.c._parse_delay_minutes("47 min late", "Delayed"), 47)
 
-    def test_hours_and_minutes(self):
+    def test_hours_and_minutes_no_space(self):
         self.assertEqual(self.c._parse_delay_minutes("1h 20m", "Delayed"), 80)
+
+    def test_hours_and_minutes_with_words(self):
+        self.assertEqual(self.c._parse_delay_minutes("1 hour 20 minutes", "Delayed"), 80)
+
+    def test_hours_and_minutes_with_and(self):
+        self.assertEqual(self.c._parse_delay_minutes("1 hour and 20 minutes", "Delayed"), 80)
 
     def test_hours_only(self):
         self.assertEqual(self.c._parse_delay_minutes("2h", "Delayed"), 120)
+
+    def test_hours_only_with_word(self):
+        self.assertEqual(self.c._parse_delay_minutes("2 hours", "Delayed"), 120)
+
+    def test_decimal_hours_converted_precisely(self):
+        # Real bug found by steward review: the old parser silently
+        # truncated "1.5 hours" to 1 hour (60 min) via int(), or under
+        # the old fallback path dropped the decimal point entirely
+        # ("1.5" -> digits "15" -> 15 minutes). Must be exactly 90.
+        self.assertEqual(self.c._parse_delay_minutes("1.5 hours", "Delayed"), 90)
+
+    def test_decimal_minutes_rounds(self):
+        self.assertEqual(self.c._parse_delay_minutes("45.5 minutes", "Delayed"), 46)
 
     def test_ontime_forces_zero_regardless_of_text(self):
         self.assertEqual(self.c._parse_delay_minutes("garbage", "OnTime"), 0)
 
     def test_cancelled_forces_zero_regardless_of_text(self):
         self.assertEqual(self.c._parse_delay_minutes("n/a", "Cancelled"), 0)
+
+    def test_diverted_forces_zero_regardless_of_text(self):
+        # Diverted triggers a payout regardless of any numeric delay
+        # (see _deterministic_verdict) - it must never be excluded
+        # from consensus just because delay_text is empty or "N/A".
+        self.assertEqual(self.c._parse_delay_minutes("N/A", "Diverted"), 0)
+        self.assertEqual(self.c._parse_delay_minutes("", "Diverted"), 0)
 
     def test_bare_number_fallback(self):
         self.assertEqual(self.c._parse_delay_minutes("75", "Delayed"), 75)
@@ -60,6 +86,30 @@ class TestParseDelayMinutes(unittest.TestCase):
 
     def test_empty_text_unparseable_when_delayed(self):
         self.assertIsNone(self.c._parse_delay_minutes("", "Delayed"))
+
+    def test_hyphen_range_is_unparseable_not_averaged_or_concatenated(self):
+        # Real bug found by steward review: the old fallback concatenated
+        # every digit with no regard for structure, turning "30-45
+        # minutes" into 3045. Must now be safely Indeterminate instead.
+        self.assertIsNone(self.c._parse_delay_minutes("30-45 minutes", "Delayed"))
+
+    def test_word_range_is_unparseable(self):
+        self.assertIsNone(self.c._parse_delay_minutes("1 to 2 hours", "Delayed"))
+
+    def test_en_dash_range_is_unparseable(self):
+        self.assertIsNone(self.c._parse_delay_minutes("30\u201345 minutes", "Delayed"))
+
+    def test_compound_with_ambiguous_decimal_hour_is_unparseable(self):
+        # "1.5 hours 30 minutes" self-contradicts (half an hour is
+        # already 30 minutes) - refuse rather than silently pick one.
+        self.assertIsNone(self.c._parse_delay_minutes("1.5 hours 30 minutes", "Delayed"))
+
+    def test_old_bug_no_longer_concatenates_compound_digits(self):
+        # Old fallback would have produced 130 (concatenating "1" and
+        # "30"); correct answer is 90.
+        result = self.c._parse_delay_minutes("1 hour 30 minutes", "Delayed")
+        self.assertEqual(result, 90)
+        self.assertNotEqual(result, 130)
 
 
 class TestDeterministicVerdict(unittest.TestCase):
@@ -210,6 +260,44 @@ class TestAggregate(unittest.TestCase):
         verdict, meta = self.c._aggregate(rows)
         self.assertEqual(verdict, "Indeterminate")
         self.assertEqual(meta["independent_total"], 1)
+
+
+class TestCanonicalAddress(unittest.TestCase):
+    def setUp(self):
+        self.c = make_contract()
+
+    def test_valid_address_passes_through_lowercased(self):
+        addr = "0x" + "A" * 40
+        self.assertEqual(self.c._canonical_address(addr), "0x" + "a" * 40)
+
+    def test_mixed_case_normalizes_to_same_canonical_form(self):
+        upper = "0x" + "AB" * 20
+        lower = "0x" + "ab" * 20
+        self.assertEqual(self.c._canonical_address(upper), self.c._canonical_address(lower))
+
+    def test_missing_0x_prefix_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("A" * 42)
+
+    def test_too_short_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("0xA")
+
+    def test_too_long_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("0x" + "A" * 41)
+
+    def test_non_hex_characters_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("0x" + "G" * 40)
+
+    def test_empty_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("")
+
+    def test_whitespace_only_rejected(self):
+        with self.assertRaises(Exception):
+            self.c._canonical_address("   ")
 
 
 if __name__ == "__main__":
