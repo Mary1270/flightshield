@@ -1,6 +1,8 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 import json
+import re
+from datetime import datetime, timedelta
 
 
 class FlightShield(gl.Contract):
@@ -104,6 +106,59 @@ class FlightShield(gl.Contract):
     matters: `fund_agreement` (moving money in) and `request_cancel`
     (moving money back out) are the only calls where the caller's
     identity, not just the data they submit, decides the outcome.
+
+    -------------------------------------------------------------------
+    STEWARD FEEDBACK ADDRESSED (v1 -> v2)
+    -------------------------------------------------------------------
+    A steward review of the first submission requested four concrete
+    fixes, all present in this version:
+
+      1. "Validate party_b as an Address and store one canonical
+         address form." `_canonical_address()` now enforces a strict
+         0x + 40-hex-char shape and lowercases the result for BOTH
+         party_a (from `gl.message.sender_address`) and the caller-
+         supplied party_b, so two different letter-casings of the same
+         real address are always the same party everywhere they're
+         compared - and a malformed party_b can never get accepted into
+         an agreement party_a can't recover from.
+
+      2. "Let party_a recover an unfunded stake after a clear timeout."
+         `reclaim_unfunded_stake()` does exactly this after
+         `UNFUNDED_TIMEOUT` (48h) of `awaiting_funding` with nobody's
+         consent needed but party_a's own, since only party_a's own
+         money is at risk at that stage. This relies on a correction to
+         an assumption in v1's own README: GenVM does NOT lack a clock -
+         it injects a deterministic, consensus-agreed
+         `datetime.datetime.now()` into every transaction (confirmed by
+         `genlayer-test`'s `genvm_datetime` fixture, used specifically
+         to pin that value for reproducible tests). v1 assumed no clock
+         existed and built freshness checks entirely on LLM content
+         classification instead; that content-based check is kept for
+         judging whether *evidence* is stale, but real elapsed-time
+         timeouts now use the real clock, which is the correct tool for
+         them.
+
+      3. "Add a deterministic terminal refund path after prolonged
+         indeterminate/unavailable evidence, without requiring both
+         parties' consent." `force_close_stalemate()` refunds each
+         party their own stake after `STALEMATE_TIMEOUT` (14 days) past
+         `funded_at`, once at least one real `resolve_agreement` attempt
+         has been made. This is deliberately callable by ANYONE (see
+         the resolver-identity rationale above) because both refund
+         destinations and amounts were fixed at `create_agreement` /
+         `fund_agreement` time - the caller cannot change the outcome,
+         only trigger it.
+
+      4. "Parse decimal, compound, or ranged delay text without
+         threshold-changing ambiguity (or safely treat it as
+         indeterminate)." `_parse_delay_minutes()` was rewritten around
+         anchored regexes for each real shape ("75 minutes", "1.5
+         hours", "1 hour 30 minutes"); an explicit range ("30-45
+         minutes", "1 to 2 hours") is NEVER resolved to a single number
+         and is instead treated as unparseable (excluded from
+         consensus), since either bound could flip the verdict against
+         a real threshold. See that method's docstring for the specific
+         bug this replaced.
     """
 
     # ------------------------------------------------------------------
@@ -132,7 +187,42 @@ class FlightShield(gl.Contract):
     )
     SIDE_WORDS = ("PayoutTriggered", "NoPayout")
     FINAL_VERDICTS = ("PayoutTriggered", "NoPayout", "Indeterminate")
-    AGREEMENT_STATUSES = ("awaiting_funding", "funded", "resolved", "cancelled")
+    AGREEMENT_STATUSES = (
+        "awaiting_funding",
+        "funded",
+        "resolved",
+        "cancelled",
+    )
+    CANCEL_REASONS = ("mutual_consent", "unfunded_timeout", "stalemate_timeout")
+
+    # A strict 0x + 40-hex-char address format check, applied to BOTH
+    # party_a (derived from gl.message.sender_address) and party_b
+    # (caller-supplied) before either is ever stored. This is
+    # independent of whatever validation the SDK's own Address type
+    # does internally - a steward review of the first version found
+    # party_b was accepted as an unvalidated free-text string with no
+    # guarantee it was even address-shaped, and that two different
+    # capitalizations of the same real address would be treated as two
+    # different parties. Every address that reaches storage now goes
+    # through `_canonical_address()`, which validates the shape AND
+    # normalizes case, so `fund_agreement`'s identity check can never
+    # silently fail (or silently succeed for the wrong party) over a
+    # checksum-casing mismatch.
+    _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+    # No on-chain wall clock exists in most smart-contract VMs, which is
+    # why the first version of this contract assumed GenVM had none
+    # either and left every stranding scenario unresolved. That
+    # assumption was wrong: GenVM injects a consensus-agreed
+    # `datetime.datetime.now()` into every transaction (the same value
+    # every validator sees, confirmed by genlayer-test's
+    # `genvm_datetime` fixture for reproducible testing), so ordinary
+    # Python `datetime` arithmetic is safe to use in deterministic
+    # contract code - no `gl.nondet` block required. `_now()` centralizes
+    # the single call site.
+    UNFUNDED_TIMEOUT = timedelta(hours=48)
+    STALEMATE_TIMEOUT = timedelta(days=14)
+    MIN_STALEMATE_ATTEMPTS = 1
 
     # A small, static, hand-maintained allowlist of flight-tracking
     # sources - same deliberate determinism trade-off documented for
@@ -196,13 +286,13 @@ class FlightShield(gl.Contract):
         committed source policy - is fixed here, before any evidence
         exists.
         """
-        sender = str(gl.message.sender_address)
+        sender = self._canonical_address(str(gl.message.sender_address))
         stake = int(gl.message.value)
 
         if stake <= 0:
             raise Exception("create_agreement requires a positive stake (attach GEN value).")
 
-        party_b_address = self._normalize_address(party_b_address)
+        party_b_address = self._canonical_address(party_b_address)
         if party_b_address == sender:
             raise Exception("party_b_address must be different from the caller (party_a).")
 
@@ -226,6 +316,7 @@ class FlightShield(gl.Contract):
 
         agreement_id = str(int(self.agreement_count))
         self.agreement_count = u256(int(self.agreement_count) + 1)
+        created_at = self._now()
 
         record = {
             "agreement_id": agreement_id,
@@ -247,6 +338,9 @@ class FlightShield(gl.Contract):
             "records": [],
             "cancel_consent_a": False,
             "cancel_consent_b": False,
+            "created_at": created_at.isoformat(),
+            "funded_at": None,
+            "cancel_reason": None,
         }
         self.agreements[agreement_id] = json.dumps(record)
         return json.dumps(record)
@@ -266,7 +360,7 @@ class FlightShield(gl.Contract):
                 f"agreement {agreement_id} is '{record['status']}', not awaiting funding."
             )
 
-        sender = str(gl.message.sender_address)
+        sender = self._canonical_address(str(gl.message.sender_address))
         if sender != record["party_b_address"]:
             raise Exception(
                 "Only the address named as party_b at creation may fund this agreement."
@@ -281,6 +375,7 @@ class FlightShield(gl.Contract):
 
         record["funded_b"] = True
         record["status"] = "funded"
+        record["funded_at"] = self._now().isoformat()
         self.agreements[agreement_id] = json.dumps(record)
         return json.dumps(record)
 
@@ -384,7 +479,7 @@ class FlightShield(gl.Contract):
                 f"agreement {agreement_id} is '{record['status']}' and can no longer be cancelled."
             )
 
-        sender = str(gl.message.sender_address)
+        sender = self._canonical_address(str(gl.message.sender_address))
         if sender == record["party_a_address"]:
             record["cancel_consent_a"] = True
         elif sender == record["party_b_address"]:
@@ -395,6 +490,7 @@ class FlightShield(gl.Contract):
         if record["cancel_consent_a"] and record["cancel_consent_b"]:
             stake = int(record["stake"])
             record["status"] = "cancelled"
+            record["cancel_reason"] = "mutual_consent"
             self.agreements[agreement_id] = json.dumps(record)
 
             # party_a always locked their stake at create_agreement.
@@ -405,6 +501,101 @@ class FlightShield(gl.Contract):
             return json.dumps(record)
 
         self.agreements[agreement_id] = json.dumps(record)
+        return json.dumps(record)
+
+    @gl.public.write
+    def reclaim_unfunded_stake(self, agreement_id: str) -> str:
+        """
+        Lets party_a recover their own stake if party_b never funds the
+        agreement within `UNFUNDED_TIMEOUT` of creation. Fixes a real
+        gap: previously an agreement stuck in `awaiting_funding` forever
+        (party_b just never shows up) had no recovery path at all -
+        `request_cancel` requires party_b's consent too, which is
+        exactly what's missing here. This path needs no one else's
+        agreement because no one else's money is at risk yet: only
+        party_a's own stake has ever been locked while
+        `status == "awaiting_funding"`.
+        """
+        record = self._load_agreement(agreement_id)
+        if record["status"] != "awaiting_funding":
+            raise Exception(
+                f"agreement {agreement_id} is '{record['status']}'; only an unfunded "
+                "agreement can be reclaimed this way."
+            )
+
+        sender = self._canonical_address(str(gl.message.sender_address))
+        if sender != record["party_a_address"]:
+            raise Exception("Only party_a may reclaim an unfunded stake.")
+
+        created_at = datetime.fromisoformat(record["created_at"])
+        deadline = created_at + self.UNFUNDED_TIMEOUT
+        now = self._now()
+        if now < deadline:
+            raise Exception(
+                f"Funding timeout not yet reached; party_b still has until "
+                f"{deadline.isoformat()} (now: {now.isoformat()})."
+            )
+
+        stake = int(record["stake"])
+        record["status"] = "cancelled"
+        record["cancel_reason"] = "unfunded_timeout"
+        self.agreements[agreement_id] = json.dumps(record)
+        gl.get_contract_at(Address(record["party_a_address"])).emit_transfer(value=stake)
+        return json.dumps(record)
+
+    @gl.public.write
+    def force_close_stalemate(self, agreement_id: str) -> str:
+        """
+        A deterministic, no-consent-required escape hatch for an
+        agreement that has been funded, genuinely attempted at least
+        once, and has sat `Indeterminate` (or simply never been
+        resolved) for longer than `STALEMATE_TIMEOUT`. Refunds each
+        party their own stake and closes the agreement.
+
+        This differs from `request_cancel` specifically to cover the
+        case `request_cancel` cannot: one party funds, evidence turns
+        out to be permanently unavailable or endlessly ambiguous, and
+        the OTHER party refuses to consent to cancellation (perhaps
+        because they're hoping a lucky future resolve_agreement call
+        goes their way, or because they've simply disappeared). Nobody
+        should be able to hold the other party's stake hostage forever
+        by just not answering. Requiring at least one real
+        `resolve_agreement` attempt (`MIN_STALEMATE_ATTEMPTS`) before
+        this is callable prevents it from being used to bail out of an
+        agreement the instant it becomes inconvenient - there must be
+        genuine, time-tested evidence trouble, not impatience.
+        Callable by anyone, like `resolve_agreement`: the refund
+        destinations and amounts were fixed long before this call, so
+        the caller's identity cannot change the outcome.
+        """
+        record = self._load_agreement(agreement_id)
+        if record["status"] != "funded":
+            raise Exception(
+                f"agreement {agreement_id} is '{record['status']}'; only a funded, "
+                "unresolved agreement can be force-closed as a stalemate."
+            )
+        if int(record["resolution_attempts"]) < self.MIN_STALEMATE_ATTEMPTS:
+            raise Exception(
+                f"At least {self.MIN_STALEMATE_ATTEMPTS} resolve_agreement attempt(s) "
+                "are required before a stalemate close can be requested."
+            )
+
+        funded_at = datetime.fromisoformat(record["funded_at"])
+        deadline = funded_at + self.STALEMATE_TIMEOUT
+        now = self._now()
+        if now < deadline:
+            raise Exception(
+                f"Stalemate timeout not yet reached; earliest close time is "
+                f"{deadline.isoformat()} (now: {now.isoformat()})."
+            )
+
+        stake = int(record["stake"])
+        record["status"] = "cancelled"
+        record["cancel_reason"] = "stalemate_timeout"
+        self.agreements[agreement_id] = json.dumps(record)
+
+        gl.get_contract_at(Address(record["party_a_address"])).emit_transfer(value=stake)
+        gl.get_contract_at(Address(record["party_b_address"])).emit_transfer(value=stake)
         return json.dumps(record)
 
     # ==================================================================
@@ -433,11 +624,37 @@ class FlightShield(gl.Contract):
             raise Exception(f"No agreement with id '{agreement_id}'.")
         return json.loads(raw)
 
-    def _normalize_address(self, address: str) -> str:
-        address = (address or "").strip()
-        if not address:
-            raise Exception("A valid address is required.")
-        return address
+    def _now(self) -> "datetime":
+        """
+        Single call site for the current consensus-agreed transaction
+        time. GenVM injects a deterministic `datetime.datetime.now()`
+        into every transaction - every validator computes the exact
+        same value for a given transaction, the same way `genlayer-test`
+        lets you pin it via a `genvm_datetime` fixture for reproducible
+        tests. Centralizing the call here means the offline test stub
+        only has to patch one thing to control time in tests.
+        """
+        return datetime.now()
+
+    def _canonical_address(self, address: str) -> str:
+        """
+        Validates that `address` is a well-formed 0x + 40-hex-char
+        address and returns its canonical (lowercased) string form.
+        Applied to BOTH party_a (from gl.message.sender_address) and
+        party_b (caller-supplied) before either is stored, so:
+          (a) a malformed party_b can never be locked into an agreement
+              party_a can't get funded, and
+          (b) two different letter-casings of the same real address are
+              always treated as the same party, everywhere they're
+              compared (fund_agreement, request_cancel, and the two new
+              timeout-recovery methods).
+        """
+        text = (address or "").strip()
+        if not self._ADDRESS_RE.match(text):
+            raise Exception(
+                f"'{address}' is not a valid address (expected 0x followed by 40 hex characters)."
+            )
+        return "0x" + text[2:].lower()
 
     def _validate_and_normalize_required_domains(self, required_source_domains):
         if not required_source_domains:
@@ -616,56 +833,80 @@ class FlightShield(gl.Contract):
         )
         return record_out
 
+    # ------------------------------------------------------------------
+    # Delay-text parsing. This replaced a version that had a real bug,
+    # found by a steward review of the first accepted submission: the
+    # primary hour/minute extraction only matched when the number was
+    # immediately adjacent to its unit letter (no space), which almost
+    # never happens in natural LLM output ("75 minutes", "1.5 hours"
+    # both have a space) - so nearly everything silently fell through
+    # to a last-resort fallback that concatenated EVERY digit in the
+    # string with no regard for structure. That fallback turned
+    # "30-45 minutes" into 3045, "1 hour 30 minutes" into 130, and
+    # "1.5 hours" into 15 (the decimal point was dropped) - each one a
+    # wrong number landing on the wrong side of a threshold silently,
+    # with no error and no Indeterminate flag. The rewrite below uses
+    # anchored regexes for each real shape delay text takes and refuses
+    # to guess (returns None -> "delay_unparseable" -> excluded from
+    # consensus, same as any other untrustworthy source) for anything
+    # a regex doesn't confidently match - most importantly, an explicit
+    # range ("30-45 minutes", "1 to 2 hours") is NEVER resolved to a
+    # single number, since picking either bound could flip the verdict
+    # against a real threshold.
+    # ------------------------------------------------------------------
+    _RANGE_PATTERN = re.compile(
+        r"(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*"
+        r"(?:h(?:ours?|rs?|r)?|m(?:in(?:ute)?s?)?)\b"
+    )
+    _HOURS_MINUTES_PATTERN = re.compile(
+        r"(\d+(?:\.\d+)?)\s*h(?:ours?|rs?|r)?\b"
+        r"\s*(?:and\s*)?"
+        r"(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\b"
+    )
+    _HOURS_ONLY_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*h(?:ours?|rs?|r)?\b")
+    _MINUTES_ONLY_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\b")
+    _BARE_NUMBER_PATTERN = re.compile(r"^(\d+(?:\.\d+)?)$")
+
     def _parse_delay_minutes(self, delay_text, status_word: str):
-        if status_word == "Cancelled":
+        if status_word in ("Cancelled", "OnTime", "Diverted"):
+            # Diverted (like Cancelled) triggers a payout regardless of
+            # any numeric delay - see _deterministic_verdict. Treating
+            # it as 0 here means a Diverted flight with delay_text
+            # "N/A" or missing still reaches a verdict instead of being
+            # wrongly excluded as "delay_unparseable".
             return 0
-        if status_word == "OnTime":
-            return 0
+
         text = (delay_text or "").strip().lower()
         if not text:
             return None
         text = text.replace(",", "")
-        hours = 0
-        minutes = 0
-        found = False
 
-        h_idx = text.find("h")
-        if h_idx > 0:
-            num = ""
-            i = h_idx - 1
-            while i >= 0 and (text[i].isdigit() or text[i] == "."):
-                num = text[i] + num
-                i -= 1
-            if num:
-                try:
-                    hours = int(float(num))
-                    found = True
-                except ValueError:
-                    pass
+        # An explicit range is inherently ambiguous for threshold
+        # comparison - never pick a bound, always treat as unparseable.
+        if self._RANGE_PATTERN.search(text):
+            return None
 
-        m_idx = text.find("m")
-        if m_idx > 0:
-            num = ""
-            i = m_idx - 1
-            while i >= 0 and (text[i].isdigit() or text[i] == "."):
-                num = text[i] + num
-                i -= 1
-            if num:
-                try:
-                    minutes = int(float(num))
-                    found = True
-                except ValueError:
-                    pass
-
-        if found:
-            return hours * 60 + minutes
-
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if digits:
-            try:
-                return int(digits)
-            except ValueError:
+        combo = self._HOURS_MINUTES_PATTERN.search(text)
+        if combo:
+            hours_text, minutes_text = combo.group(1), combo.group(2)
+            # "1.5 hours 30 minutes" is a self-contradictory compound
+            # (which half-hour is it?) - refuse rather than guess.
+            if "." in hours_text:
                 return None
+            return int(hours_text) * 60 + round(float(minutes_text))
+
+        hours_only = self._HOURS_ONLY_PATTERN.search(text)
+        if hours_only:
+            return round(float(hours_only.group(1)) * 60)
+
+        minutes_only = self._MINUTES_ONLY_PATTERN.search(text)
+        if minutes_only:
+            return round(float(minutes_only.group(1)))
+
+        bare = self._BARE_NUMBER_PATTERN.match(text)
+        if bare:
+            return round(float(bare.group(1)))
+
         return None
 
     def _deterministic_verdict(self, status_word: str, delay_minutes: int, threshold: int) -> str:

@@ -19,6 +19,32 @@ open*. See the full rationale in `contract.py`'s class docstring.
 | `party_a` / `party_b` are free-text strings, not bound to a caller identity | `party_a` / `party_b` **are** `gl.message.sender_address` values, checked on every fund-moving call |
 | A committed source policy can strand an agreement forever, with no on-chain recovery | `request_cancel`: mutual-consent cancellation refunds both parties their own stake, no oracle result required |
 
+## v2: steward feedback addressed
+
+A steward review of the v1 submission requested four concrete fixes.
+All four are implemented, tested, and documented in `contract.py`'s
+class docstring (see "STEWARD FEEDBACK ADDRESSED"):
+
+| Steward request | Fix |
+|---|---|
+| Validate party_b as an Address and store one canonical address form | `_canonical_address()` enforces a strict `0x` + 40-hex-char shape and lowercases the result for **both** party_a and party_b before storage or comparison |
+| Let party_a recover an unfunded stake after a clear timeout | `reclaim_unfunded_stake()` - party_a only, after `UNFUNDED_TIMEOUT` (48h) of no funding |
+| A deterministic terminal refund path after prolonged indeterminate/unavailable evidence, without both parties' consent | `force_close_stalemate()` - callable by anyone, after `STALEMATE_TIMEOUT` (14 days) past funding **and** at least one real resolve attempt |
+| Parse decimal, compound, or ranged delay text without threshold-changing ambiguity | `_parse_delay_minutes()` rewritten around anchored regexes; explicit ranges are never resolved to a single number |
+
+**Important correction from v1:** the v1 README claimed GenVM has no
+on-chain clock and built every time-sensitive check on LLM content
+classification alone. That claim was wrong. GenVM injects a
+deterministic, consensus-agreed `datetime.datetime.now()` into every
+transaction (confirmed by `genlayer-test`'s `genvm_datetime` fixture,
+built specifically to pin that value for reproducible testing) - every
+validator computes the exact same value for a given transaction, so
+ordinary Python `datetime` arithmetic is safe in deterministic contract
+code. The two new timeout methods use the real clock; the existing
+`FRESHNESS` check still uses LLM content classification, since it's
+answering a different question (does this *evidence* reflect the
+current situation, not how much wall-clock time has passed).
+
 ## How it works
 
 1. **`create_agreement`** (payable) - Party A locks their stake, names
@@ -44,6 +70,17 @@ open*. See the full rationale in `contract.py`'s class docstring.
    the same transaction.
 4. **`request_cancel`** - Either party can call this before
    resolution; once both have, each gets their own stake back.
+5. **`reclaim_unfunded_stake`** - If party_b never funds, party_a
+   recovers their own stake alone once `UNFUNDED_TIMEOUT` (48h) has
+   passed since `create_agreement` - no one else's money is at risk at
+   that stage, so no one else's consent is needed.
+6. **`force_close_stalemate`** - If the agreement is funded but stuck
+   (evidence is permanently unavailable or endlessly `Indeterminate`)
+   for longer than `STALEMATE_TIMEOUT` (14 days) past funding, and at
+   least one real `resolve_agreement` attempt has been made, anyone can
+   trigger a refund of each party's own stake. This covers the case
+   `request_cancel` can't: one party wants out but the other won't
+   consent.
 
 ## Reputable source allowlist
 
@@ -73,7 +110,7 @@ planefinder.net
 
 ## Testing
 
-76 offline unit tests across two files, run with plain `unittest`
+112 offline unit tests across two files, run with plain `unittest`
 (no network access needed, no live GenLayer node needed):
 
 ```bash
@@ -157,18 +194,17 @@ subdomains of the same tracker down to one independent source.
   a bet between two named wallets, not a marketplace with a shared
   liquidity pool, partial fills, or premium pricing. A pooled version
   would need its own solvency/collateralization model - out of scope
-  for a first version.
-- **No trusted on-chain clock.** GenVM does not expose a validator-
-  agreed timestamp (`gl.block.timestamp` does not exist), so there is
-  no hard "claim by this block" deadline. Staleness is instead
-  enforced the same way OilPriceOracle enforces freshness: content-
-  based LLM classification (`FRESHNESS`) of whether the fetched page
-  actually reflects the queried flight/date, not a clock comparison.
-  In practice this means a resolution attempt long after the flight
-  date should reliably fail the freshness check on live tracking
-  sites (which stop showing "current" status for old flights), but
-  that is a content-availability property of those sites, not a
-  contract-enforced guarantee.
+  for a first version. (Addressed in a separate contract, WeatherVault,
+  which is exactly that pooled version applied to a different domain.)
+- **~~No trusted on-chain clock~~ - corrected in v2.** v1 claimed GenVM
+  has no validator-agreed timestamp and built every time check on LLM
+  content classification alone. That was wrong: GenVM injects a
+  deterministic `datetime.datetime.now()` into every transaction (see
+  "v2: steward feedback addressed" above), and `reclaim_unfunded_stake`
+  / `force_close_stalemate` now use it for real elapsed-time timeouts.
+  The `FRESHNESS` LLM classification is kept for what it's actually
+  suited to: judging whether a fetched page's *content* reflects the
+  current situation, not how much wall-clock time has passed.
   **Confirmed empirically during live testing**: for a given flight
   number, tracking sites only populate live status *after departure*
   ("FlightAware couldn't find flight tracking data ... just yet" was
