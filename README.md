@@ -45,6 +45,30 @@ code. The two new timeout methods use the real clock; the existing
 answering a different question (does this *evidence* reflect the
 current situation, not how much wall-clock time has passed).
 
+## v3: range-detection gap closed
+
+The v2 fix for delay-text ranges only caught the shape where a unit
+appears right after the *second* number ("30-45 minutes"). A steward
+found that phrasings like **"between 30 and 45 minutes"** (connector
+"and", unit only after the second number) and **"30 minutes to 1
+hour"** (each number carries its own unit) slipped past that check
+entirely and were silently resolved to one bound by the hours/minutes
+patterns - the same threshold-flipping risk v2 was meant to eliminate,
+just via a different phrasing.
+
+`_RANGE_CONNECTOR_PATTERN` now matches ANY two numbers joined by a
+dash/en-dash/em-dash/"to"/"and", with units optional on either side,
+and treats it as unparseable - *unless* it's specifically the
+legitimate "N hour(s) and M minute(s)" compound-duration shape
+(connector "and", first unit category hour, second category minute),
+which is a single duration, not a range, and still parses correctly
+(e.g. "1 hour and 30 minutes" -> 90).
+
+While fixing this, the same latent bug was found and fixed
+**proactively** in WeatherVault's `_parse_metric_value` (it silently
+returned the first bound of "30-45mm" instead of flagging it as
+ambiguous) - see that project's own README for details.
+
 ## How it works
 
 1. **`create_agreement`** (payable) - Party A locks their stake, names
@@ -110,7 +134,7 @@ planefinder.net
 
 ## Testing
 
-112 offline unit tests across two files, run with plain `unittest`
+116 offline unit tests across two files, run with plain `unittest`
 (no network access needed, no live GenLayer node needed):
 
 ```bash

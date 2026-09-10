@@ -834,29 +834,40 @@ class FlightShield(gl.Contract):
         return record_out
 
     # ------------------------------------------------------------------
-    # Delay-text parsing. This replaced a version that had a real bug,
-    # found by a steward review of the first accepted submission: the
-    # primary hour/minute extraction only matched when the number was
-    # immediately adjacent to its unit letter (no space), which almost
-    # never happens in natural LLM output ("75 minutes", "1.5 hours"
-    # both have a space) - so nearly everything silently fell through
-    # to a last-resort fallback that concatenated EVERY digit in the
-    # string with no regard for structure. That fallback turned
-    # "30-45 minutes" into 3045, "1 hour 30 minutes" into 130, and
-    # "1.5 hours" into 15 (the decimal point was dropped) - each one a
-    # wrong number landing on the wrong side of a threshold silently,
-    # with no error and no Indeterminate flag. The rewrite below uses
-    # anchored regexes for each real shape delay text takes and refuses
-    # to guess (returns None -> "delay_unparseable" -> excluded from
-    # consensus, same as any other untrustworthy source) for anything
-    # a regex doesn't confidently match - most importantly, an explicit
-    # range ("30-45 minutes", "1 to 2 hours") is NEVER resolved to a
-    # single number, since picking either bound could flip the verdict
-    # against a real threshold.
+    # Delay-text parsing. Rewritten twice now, both times after a
+    # steward found a real gap:
+    #
+    #   v1 -> v2: the original hour/minute extraction only matched a
+    #   number immediately adjacent to its unit letter (no space),
+    #   which almost never happens in natural LLM output ("75 minutes",
+    #   "1.5 hours" both have a space) - so nearly everything fell
+    #   through to a last-resort fallback that concatenated EVERY digit
+    #   in the string with no regard for structure ("30-45 minutes" ->
+    #   3045, "1 hour 30 minutes" -> 130, "1.5 hours" -> 15). Fixed by
+    #   introducing anchored regexes plus a dedicated range check that
+    #   refuses to resolve "30-45 minutes" / "1 to 2 hours" to a single
+    #   number.
+    #
+    #   v2 -> v3: that range check only fired when the unit appeared
+    #   immediately after the SECOND number ("30-45 minutes"). Natural
+    #   phrasings like "between 30 and 45 minutes" (connector "and",
+    #   unit only after the second number) and "30 minutes to 1 hour"
+    #   (each number already carries its own unit) slipped past it
+    #   entirely and got silently resolved to one bound by the
+    #   hours/minutes patterns below. `_RANGE_CONNECTOR_PATTERN` now
+    #   matches ANY two numbers joined by a dash/en-dash/em-dash/"to"/
+    #   "and", with units optional on either side, and is treated as an
+    #   unparseable range UNLESS it is specifically the legitimate
+    #   compound-duration shape "N hour(s) and M minute(s)" (connector
+    #   "and", first unit category hour, second unit category minute) -
+    #   which is a single duration, not a range, and is handled by
+    #   `_HOURS_MINUTES_PATTERN` immediately below as before.
     # ------------------------------------------------------------------
-    _RANGE_PATTERN = re.compile(
-        r"(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*"
-        r"(?:h(?:ours?|rs?|r)?|m(?:in(?:ute)?s?)?)\b"
+    _UNIT_GROUP = r"(h(?:ours?|rs?|r)?|m(?:in(?:ute)?s?)?)"
+    _RANGE_CONNECTOR_PATTERN = re.compile(
+        r"(\d+(?:\.\d+)?)\s*" + _UNIT_GROUP + r"?\s*"
+        r"(-|–|—|to|and)\s*"
+        r"(\d+(?:\.\d+)?)\s*" + _UNIT_GROUP + r"?"
     )
     _HOURS_MINUTES_PATTERN = re.compile(
         r"(\d+(?:\.\d+)?)\s*h(?:ours?|rs?|r)?\b"
@@ -866,6 +877,15 @@ class FlightShield(gl.Contract):
     _HOURS_ONLY_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*h(?:ours?|rs?|r)?\b")
     _MINUTES_ONLY_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\b")
     _BARE_NUMBER_PATTERN = re.compile(r"^(\d+(?:\.\d+)?)$")
+
+    def _unit_category(self, unit_text):
+        if not unit_text:
+            return None
+        if unit_text.startswith("h"):
+            return "H"
+        if unit_text.startswith("m"):
+            return "M"
+        return None
 
     def _parse_delay_minutes(self, delay_text, status_word: str):
         if status_word in ("Cancelled", "OnTime", "Diverted"):
@@ -882,9 +902,18 @@ class FlightShield(gl.Contract):
         text = text.replace(",", "")
 
         # An explicit range is inherently ambiguous for threshold
-        # comparison - never pick a bound, always treat as unparseable.
-        if self._RANGE_PATTERN.search(text):
-            return None
+        # comparison - never pick a bound, always treat as unparseable,
+        # UNLESS this is actually the legitimate "N hour(s) and M
+        # minute(s)" compound-duration shape (see the header comment
+        # above for why "and" alone isn't enough to tell these apart).
+        range_match = self._RANGE_CONNECTOR_PATTERN.search(text)
+        if range_match:
+            connector = range_match.group(3)
+            cat1 = self._unit_category(range_match.group(2))
+            cat2 = self._unit_category(range_match.group(5))
+            is_hour_and_minute_compound = connector == "and" and cat1 == "H" and cat2 == "M"
+            if not is_hour_and_minute_compound:
+                return None
 
         combo = self._HOURS_MINUTES_PATTERN.search(text)
         if combo:
