@@ -99,6 +99,31 @@ class TestParseDelayMinutes(unittest.TestCase):
     def test_en_dash_range_is_unparseable(self):
         self.assertIsNone(self.c._parse_delay_minutes("30\u201345 minutes", "Delayed"))
 
+    def test_between_and_range_is_unparseable(self):
+        # Second steward finding: the original range check only fired
+        # when the unit appeared right after the SECOND number
+        # ("30-45 minutes"), so "between 30 and 45 minutes" (connector
+        # "and", unit only after the second number) slipped through and
+        # got silently resolved to one bound. Must be Indeterminate.
+        self.assertIsNone(
+            self.c._parse_delay_minutes("between 30 and 45 minutes", "Delayed")
+        )
+
+    def test_mixed_unit_to_range_is_unparseable(self):
+        # "30 minutes to 1 hour" - each number carries its own unit,
+        # a shape the original fix also missed.
+        self.assertIsNone(self.c._parse_delay_minutes("30 minutes to 1 hour", "Delayed"))
+
+    def test_same_unit_and_range_is_unparseable(self):
+        self.assertIsNone(
+            self.c._parse_delay_minutes("30 minutes and 45 minutes", "Delayed")
+        )
+
+    def test_hour_and_minute_compound_is_not_misdetected_as_range(self):
+        # The one legitimate use of "and" between two numbers: a single
+        # duration, not a range. Must still parse correctly to 90.
+        self.assertEqual(self.c._parse_delay_minutes("1 hour and 30 minutes", "Delayed"), 90)
+
     def test_compound_with_ambiguous_decimal_hour_is_unparseable(self):
         # "1.5 hours 30 minutes" self-contradicts (half an hour is
         # already 30 minutes) - refuse rather than silently pick one.
