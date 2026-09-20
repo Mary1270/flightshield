@@ -3,6 +3,7 @@ from genlayer import *
 import json
 import re
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 
 class FlightShield(gl.Contract):
@@ -684,20 +685,69 @@ class FlightShield(gl.Contract):
         return sorted(normalized)
 
     def _extract_domain(self, url_or_domain: str) -> str:
+        """
+        Extracts a hostname from either a bare domain (as used in
+        `required_source_domains`, e.g. "flightaware.com") or a full
+        URL fetched by `gl.nondet.web.render()`.
+
+        STEWARD FEEDBACK ADDRESSED (v3.1): the previous implementation
+        split the string on the FIRST ":" after stripping the scheme,
+        so "https://flightaware.com:443@attacker.example/" became
+        "flightaware.com" - the ":443@attacker.example" tail (the real
+        host, per the URL spec) was silently discarded. That let a
+        malicious source masquerade as an allowlisted domain and
+        influence a real GEN payout. This version parses the URL with
+        `urllib.parse.urlsplit`, which correctly resolves userinfo
+        (anything before "@") separately from the host, so the same
+        string now correctly resolves to "attacker.example" - and is
+        rejected outright below, since a URL carrying credentials is
+        refused regardless of what host it ultimately resolves to.
+        """
         text = (url_or_domain or "").strip().lower()
-        text = text.split("://", 1)[-1]
-        text = text.split("/", 1)[0]
-        text = text.split(":", 1)[0]
-        text = text.split("?", 1)[0]
-        text = text.split("#", 1)[0]
-        if text.startswith("www."):
-            text = text[4:]
-        parts = text.split(".")
+        if not text:
+            return ""
+
+        if "://" in text:
+            try:
+                parsed = urlsplit(text)
+            except ValueError:
+                return ""
+
+            # Only ever fetch/trust plain HTTP(S) sources.
+            if parsed.scheme not in ("http", "https"):
+                return ""
+
+            # Reject any URL carrying embedded credentials
+            # (user:pass@host or host:port@host). Legitimate
+            # flight-tracking URLs never need this, and it's exactly
+            # the vector used to smuggle an attacker-controlled host
+            # past a naive string-based domain check.
+            if "@" in parsed.netloc:
+                return ""
+
+            try:
+                hostname = parsed.hostname
+            except ValueError:
+                # Malformed host (e.g. bad IPv6 literal).
+                return ""
+        else:
+            # A bare domain/host string, not a full URL.
+            hostname = text.split("/", 1)[0].split(":", 1)[0]
+            hostname = hostname.split("?", 1)[0].split("#", 1)[0]
+
+        if not hostname:
+            return ""
+
+        hostname = hostname.lower()
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+
+        parts = hostname.split(".")
         if len(parts) >= 3:
             last_two = ".".join(parts[-2:])
-            if last_two in self.KNOWN_MULTI_PART_SUFFIXES and len(parts) >= 3:
+            if last_two in self.KNOWN_MULTI_PART_SUFFIXES:
                 return ".".join(parts[-3:])
-        return text
+        return hostname
 
     def _canonical_reputable_domain(self, domain: str):
         """

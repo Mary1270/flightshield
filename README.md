@@ -69,6 +69,27 @@ While fixing this, the same latent bug was found and fixed
 returned the first bound of "30-45mm" instead of flagging it as
 ambiguous) - see that project's own README for details.
 
+## v3.1: source URL validation hardened
+
+A steward found that `_extract_domain`'s naive string-splitting logic
+(strip scheme, then split on the first `/`, `:`, `?`, `#`) could be
+fooled by a URL like `https://flightaware.com:443@attacker.example/`:
+per the URL spec, everything before `@` is userinfo, so the real host
+is `attacker.example` - but the old logic split on the first `:` and
+returned `flightaware.com`, letting a non-reputable, attacker-controlled
+page influence a real GEN payout.
+
+`_extract_domain` now parses full URLs with `urllib.parse.urlsplit`,
+which correctly separates userinfo/host/port; requires the scheme to
+be `http` or `https`; and rejects outright any URL whose authority
+contains `@` (embedded credentials), regardless of what host it would
+otherwise resolve to, since a legitimate flight-tracking URL never
+carries credentials. Malformed URLs (e.g. a bad IPv6 literal) are also
+rejected rather than raising. Six new tests cover the exact
+steward-flagged case, a credentials-bearing allowlisted-looking host,
+non-HTTP(S) schemes, and malformed input - offline suite is now 122
+tests, all passing.
+
 ## How it works
 
 1. **`create_agreement`** (payable) - Party A locks their stake, names
@@ -134,7 +155,7 @@ planefinder.net
 
 ## Testing
 
-116 offline unit tests across two files, run with plain `unittest`
+122 offline unit tests across two files, run with plain `unittest`
 (no network access needed, no live GenLayer node needed):
 
 ```bash
