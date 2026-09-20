@@ -29,6 +29,44 @@ class TestExtractDomain(unittest.TestCase):
     def test_case_insensitive(self):
         self.assertEqual(self.c._extract_domain("FlightAware.COM/x"), "flightaware.com")
 
+    def test_userinfo_spoofing_is_rejected_not_resolved_to_flightaware(self):
+        # https://flightaware.com:443@attacker.example/ is the exact
+        # steward-flagged case: per the URL spec the real host is
+        # attacker.example (everything before "@" is userinfo), so
+        # the old naive colon-split that returned "flightaware.com"
+        # was wrong either way. This contract goes a step further and
+        # rejects the whole URL outright whenever it carries
+        # credentials, rather than trusting the resolved host.
+        self.assertEqual(
+            self.c._extract_domain("https://flightaware.com:443@attacker.example/"),
+            "",
+        )
+
+    def test_credentials_in_url_are_rejected_outright(self):
+        # Any URL carrying userinfo is refused regardless of host,
+        # even if the host itself happens to be allowlisted.
+        self.assertEqual(
+            self.c._extract_domain("https://user:pass@flightaware.com/live/flight/AA100"),
+            "",
+        )
+
+    def test_userinfo_spoofing_is_not_reputable(self):
+        annotated = self.c._annotate_sources(
+            ["https://flightaware.com:443@attacker.example/"]
+        )
+        self.assertFalse(annotated[0]["is_reputable"])
+        self.assertNotEqual(annotated[0]["canonical_domain"], "flightaware.com")
+
+    def test_non_http_scheme_rejected(self):
+        self.assertEqual(self.c._extract_domain("ftp://flightaware.com/x"), "")
+
+    def test_malformed_url_does_not_raise(self):
+        self.assertEqual(self.c._extract_domain("https://[::1"), "")
+
+    def test_empty_and_none_input(self):
+        self.assertEqual(self.c._extract_domain(""), "")
+        self.assertEqual(self.c._extract_domain(None), "")
+
 
 class TestParseDelayMinutes(unittest.TestCase):
     def setUp(self):
